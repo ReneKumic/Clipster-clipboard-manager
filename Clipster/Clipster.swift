@@ -7,6 +7,8 @@
 
 import SwiftUI
 import AppKit
+internal import Combine
+import Carbon
 
 // MARK: - Models
 
@@ -38,6 +40,27 @@ struct ClipboardItem: Identifiable, Codable {
         self.type = type
         self.imageData = imageData
         self.imageFileName = imageFileName
+    }
+    
+    // Custom Codable implementation to exclude imageData
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        content = try container.decode(String.self, forKey: .content)
+        timestamp = try container.decode(Date.self, forKey: .timestamp)
+        type = try container.decode(ClipboardType.self, forKey: .type)
+        imageFileName = try container.decodeIfPresent(String.self, forKey: .imageFileName)
+        imageData = nil  // Not persisted
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(content, forKey: .content)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(type, forKey: .type)
+        try container.encodeIfPresent(imageFileName, forKey: .imageFileName)
+        // imageData is intentionally not encoded
     }
 }
 
@@ -87,8 +110,9 @@ class ClipboardManager: ObservableObject {
         guard pasteboard.changeCount != lastChangeCount else { return }
         lastChangeCount = pasteboard.changeCount
         
-        // Check for image data first (screenshots and copied images)
-        if let imageData = pasteboard.data(forType: .tiff) ?? pasteboard.data(forType: .png) {
+        // Check for image data first (screenshots and copied images).
+        // NSImage(pasteboard:) handles all image UTIs (tiff, png, pict, etc.)
+        if let image = NSImage(pasteboard: pasteboard), let imageData = image.tiffRepresentation {
             var newItem = ClipboardItem(content: "Image", type: .image, imageData: imageData)
             let fileName = "\(newItem.id.uuidString).tiff"
             saveImageFile(data: imageData, named: fileName)
@@ -445,23 +469,57 @@ struct ClipboardItemView: View {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
-    
+    private var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        
+
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "Clipster")
             button.action = #selector(togglePopover)
             button.target = self
         }
-        
+
         popover = NSPopover()
         popover.contentSize = NSSize(width: 400, height: 500)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: ContentView())
+
+        registerHotKey()
     }
-    
+
+    // Registers Cmd+Shift+V as a global hotkey via Carbon (no Accessibility permission needed)
+    private func registerHotKey() {
+        var hotKeyID = EventHotKeyID()
+        hotKeyID.signature = OSType(0x434C5053) // "CLPS"
+        hotKeyID.id = 1
+
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { (_, _, userData) -> OSStatus in
+                guard let userData = userData else { return noErr }
+                let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                DispatchQueue.main.async { delegate.togglePopover() }
+                return noErr
+            },
+            1, &eventType, selfPtr, nil
+        )
+
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_V),           // V key
+            UInt32(cmdKey | shiftKey),     // Cmd+Shift
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0, &hotKeyRef
+        )
+    }
+
     @objc func togglePopover() {
         if let button = statusItem.button {
             if popover.isShown {
@@ -488,3 +546,4 @@ struct ClipsterApp: App {
 
 // Made by Rene Kumic on 18.02.2026.
 //This app is created when the MacOS lacked clipboard manager with screenshots and all features, and all apps that required payments are too expensive. 
+
