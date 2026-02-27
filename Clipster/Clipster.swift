@@ -17,13 +17,14 @@ struct ClipboardItem: Identifiable, Codable {
     let content: String
     let timestamp: Date
     let type: ClipboardType
+    var isPinned: Bool
     var imageFileName: String?
-    
+
     // Runtime only — not persisted, loaded from disk on launch
     var imageData: Data? = nil
-    
+
     enum CodingKeys: String, CodingKey {
-        case id, content, timestamp, type, imageFileName
+        case id, content, timestamp, type, isPinned, imageFileName
     }
     
     enum ClipboardType: String, Codable {
@@ -33,11 +34,12 @@ struct ClipboardItem: Identifiable, Codable {
         case image
     }
     
-    init(content: String, type: ClipboardType = .text, imageData: Data? = nil, imageFileName: String? = nil) {
+    init(content: String, type: ClipboardType = .text, isPinned: Bool = false, imageData: Data? = nil, imageFileName: String? = nil) {
         self.id = UUID()
         self.content = content
         self.timestamp = Date()
         self.type = type
+        self.isPinned = isPinned
         self.imageData = imageData
         self.imageFileName = imageFileName
     }
@@ -49,6 +51,7 @@ struct ClipboardItem: Identifiable, Codable {
         content = try container.decode(String.self, forKey: .content)
         timestamp = try container.decode(Date.self, forKey: .timestamp)
         type = try container.decode(ClipboardType.self, forKey: .type)
+        isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         imageFileName = try container.decodeIfPresent(String.self, forKey: .imageFileName)
         imageData = nil  // Not persisted
     }
@@ -59,6 +62,7 @@ struct ClipboardItem: Identifiable, Codable {
         try container.encode(content, forKey: .content)
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(type, forKey: .type)
+        try container.encode(isPinned, forKey: .isPinned)
         try container.encodeIfPresent(imageFileName, forKey: .imageFileName)
         // imageData is intentionally not encoded
     }
@@ -74,7 +78,18 @@ class ClipboardManager: ObservableObject {
     private var expiryTimer: Timer?
     private let maxItems = 100
     private let expiryInterval: TimeInterval = 12 * 60 * 60  // 12 hours
-    
+
+    // Screenshot directory polling
+    private var screenshotTimer: Timer?
+    private var knownScreenshotFiles: Set<String> = []
+    private lazy var screenshotsDirectory: URL = {
+        // Check the macOS screencapture preference for a custom save location
+        if let customPath = UserDefaults(suiteName: "com.apple.screencapture")?.string(forKey: "location") {
+            return URL(fileURLWithPath: (customPath as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+    }()
+
     // Images stored as TIFF files in Application Support/Clipster/images/
     private static let imagesDirectory: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -82,25 +97,86 @@ class ClipboardManager: ObservableObject {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
-    
+
     init() {
         loadHistory()
+        seedKnownScreenshots()
         startMonitoring()
         startExpiryTimer()
+        startScreenshotPolling()
     }
-    
+
     // MARK: - Monitoring
-    
+
     func startMonitoring() {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.checkClipboard()
         }
     }
-    
+
     private func startExpiryTimer() {
         // Check for expired items every hour
         expiryTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.removeExpiredItems()
+        }
+    }
+
+    // MARK: - Screenshot Directory Polling
+
+    /// Seed the known files set so we only pick up NEW screenshots after launch
+    private func seedKnownScreenshots() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: screenshotsDirectory.path) else { return }
+        knownScreenshotFiles = Set(files)
+    }
+
+    /// Poll the screenshots directory every 2 seconds for new PNG files.
+    /// macOS shows a floating thumbnail for ~5 seconds before writing the file,
+    /// so timer-based polling is more reliable than DispatchSource.
+    private func startScreenshotPolling() {
+        screenshotTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.scanForNewScreenshots()
+        }
+    }
+
+    private func scanForNewScreenshots() {
+        let fm = FileManager.default
+        guard let allFiles = try? fm.contentsOfDirectory(atPath: screenshotsDirectory.path) else { return }
+        let currentSet = Set(allFiles)
+        let newFiles = currentSet.subtracting(knownScreenshotFiles)
+        knownScreenshotFiles = currentSet
+
+        guard !newFiles.isEmpty else { return }
+
+        let now = Date()
+
+        for fileName in newFiles {
+            // Only pick up PNG files (macOS screenshots are PNG)
+            guard fileName.lowercased().hasSuffix(".png") else { continue }
+
+            let fileURL = screenshotsDirectory.appendingPathComponent(fileName)
+
+            // Verify it was created recently (within 30 seconds to account for thumbnail delay)
+            guard let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
+                  let creationDate = attrs[.creationDate] as? Date,
+                  now.timeIntervalSince(creationDate) < 30 else { continue }
+
+            guard let imageData = try? Data(contentsOf: fileURL),
+                  let nsImage = NSImage(data: imageData),
+                  let tiffData = nsImage.tiffRepresentation else { continue }
+
+            var newItem = ClipboardItem(content: "Screenshot", type: .image, imageData: tiffData)
+            let storedName = "\(newItem.id.uuidString).tiff"
+            saveImageFile(data: tiffData, named: storedName)
+            newItem.imageFileName = storedName
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                let insertIndex = self.items.firstIndex(where: { !$0.isPinned }) ?? self.items.endIndex
+                self.items.insert(newItem, at: insertIndex)
+                self.trimToMaxItems()
+                self.saveHistory()
+            }
         }
     }
     
@@ -119,17 +195,21 @@ class ClipboardManager: ObservableObject {
             newItem.imageFileName = fileName
             
             DispatchQueue.main.async {
-                self.items.insert(newItem, at: 0)
+                let insertIndex = self.items.firstIndex(where: { !$0.isPinned }) ?? self.items.endIndex
+                self.items.insert(newItem, at: insertIndex)
                 self.trimToMaxItems()
                 self.saveHistory()
             }
         } else if let string = pasteboard.string(forType: .string), !string.isEmpty {
-            guard items.first?.content != string else { return }
+            // Check against the first unpinned item to avoid duplicates
+            let firstUnpinned = self.items.first(where: { !$0.isPinned })
+            guard firstUnpinned?.content != string else { return }
             let type = detectType(for: string)
             let newItem = ClipboardItem(content: string, type: type)
-            
+
             DispatchQueue.main.async {
-                self.items.insert(newItem, at: 0)
+                let insertIndex = self.items.firstIndex(where: { !$0.isPinned }) ?? self.items.endIndex
+                self.items.insert(newItem, at: insertIndex)
                 self.trimToMaxItems()
                 self.saveHistory()
             }
@@ -137,23 +217,25 @@ class ClipboardManager: ObservableObject {
     }
     
     private func trimToMaxItems() {
-        guard items.count > maxItems else { return }
-        let pruned = Array(items.dropFirst(maxItems))
+        let unpinned = items.filter { !$0.isPinned }
+        guard unpinned.count > maxItems else { return }
+        let pruned = Array(unpinned.dropFirst(maxItems))
         for item in pruned where item.type == .image {
             if let fileName = item.imageFileName { deleteImageFile(named: fileName) }
         }
-        items = Array(items.prefix(maxItems))
+        let prunedIDs = Set(pruned.map { $0.id })
+        items.removeAll { prunedIDs.contains($0.id) }
     }
     
     // MARK: - Expiry
     
     private func removeExpiredItems() {
         let cutoff = Date().addingTimeInterval(-expiryInterval)
-        for item in items where item.timestamp < cutoff && item.type == .image {
+        for item in items where !item.isPinned && item.timestamp < cutoff && item.type == .image {
             if let fileName = item.imageFileName { deleteImageFile(named: fileName) }
         }
         let before = items.count
-        items.removeAll { $0.timestamp < cutoff }
+        items.removeAll { !$0.isPinned && $0.timestamp < cutoff }
         if items.count != before { saveHistory() }
     }
     
@@ -190,6 +272,17 @@ class ClipboardManager: ObservableObject {
         }
     }
     
+    func togglePin(_ item: ClipboardItem) {
+        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[index].isPinned.toggle()
+
+        // Re-sort: pinned items first, then unpinned, each group keeps its order
+        let pinned = items.filter { $0.isPinned }
+        let unpinned = items.filter { !$0.isPinned }
+        items = pinned + unpinned
+        saveHistory()
+    }
+
     func deleteItem(_ item: ClipboardItem) {
         if item.type == .image, let fileName = item.imageFileName {
             deleteImageFile(named: fileName)
@@ -238,11 +331,11 @@ class ClipboardManager: ObservableObject {
         
         let cutoff = Date().addingTimeInterval(-expiryInterval)
         
-        // Delete image files for expired items before filtering
-        for item in decoded where item.timestamp < cutoff && item.type == .image {
+        // Delete image files for expired unpinned items before filtering
+        for item in decoded where !item.isPinned && item.timestamp < cutoff && item.type == .image {
             if let fileName = item.imageFileName { deleteImageFile(named: fileName) }
         }
-        decoded = decoded.filter { $0.timestamp >= cutoff }
+        decoded = decoded.filter { $0.isPinned || $0.timestamp >= cutoff }
         
         // Load image data from disk for image items
         for i in decoded.indices {
@@ -258,18 +351,33 @@ class ClipboardManager: ObservableObject {
 
 // MARK: - Views
 
+enum ClipboardTab: String, CaseIterable {
+    case snippets = "Snippets"
+    case screenshots = "Screenshots"
+}
+
 struct ContentView: View {
     @StateObject private var clipboardManager = ClipboardManager()
     @State private var searchText = ""
     @State private var hoveredItemId: UUID?
-    
+    @State private var selectedIndex: Int?
+    @State private var keyMonitor: Any?
+    @State private var selectedTab: ClipboardTab = .snippets
+
     var filteredItems: [ClipboardItem] {
-        if searchText.isEmpty {
-            return clipboardManager.items
+        var base = clipboardManager.items
+
+        // Filter by tab
+        switch selectedTab {
+        case .snippets:
+            base = base.filter { $0.type != .image }
+        case .screenshots:
+            base = base.filter { $0.type == .image }
         }
-        return clipboardManager.items.filter { $0.content.localizedCaseInsensitiveContains(searchText) }
+
+        if searchText.isEmpty { return base }
+        return base.filter { $0.content.localizedCaseInsensitiveContains(searchText) }
     }
-    
 
     var body: some View {
         VStack(spacing: 0) {
@@ -281,11 +389,12 @@ struct ContentView: View {
                 Text("Clipster")
                     .font(.title2)
                     .fontWeight(.bold)
-                
+
                 Spacer()
-                
+
                 Button(action: {
                     clipboardManager.clearAll()
+                    selectedIndex = nil
                 }) {
                     Image(systemName: "trash")
                         .foregroundColor(.red)
@@ -295,14 +404,24 @@ struct ContentView: View {
             }
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
-            
+
+            // Tab picker
+            Picker("", selection: $selectedTab) {
+                ForEach(ClipboardTab.allCases, id: \.self) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+
             // Search bar
             HStack {
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(.gray)
-                TextField("Search clipboard...", text: $searchText)
+                TextField(selectedTab == .snippets ? "Search snippets..." : "Search screenshots...", text: $searchText)
                     .textFieldStyle(.plain)
-                
+
                 if !searchText.isEmpty {
                     Button(action: {
                         searchText = ""
@@ -318,62 +437,210 @@ struct ContentView: View {
             .cornerRadius(8)
             .padding(.horizontal)
             .padding(.bottom, 10)
-            
+
             Divider()
-            
+
             // Clipboard items list
             if filteredItems.isEmpty {
                 VStack(spacing: 16) {
-                    Image(systemName: "doc.on.clipboard")
+                    Image(systemName: selectedTab == .snippets ? "doc.on.clipboard" : "camera.viewfinder")
                         .font(.system(size: 48))
                         .foregroundColor(.gray)
-                    Text("No clipboard items yet")
+                    Text(selectedTab == .snippets ? "No snippets yet" : "No screenshots yet")
                         .foregroundColor(.secondary)
+                    if selectedTab == .screenshots {
+                        Text("Take a screenshot with \u{2318}\u{21E7}3 or \u{2318}\u{21E7}4")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        ForEach(filteredItems) { item in
-                            ClipboardItemView(
-                                item: item,
-                                isHovered: hoveredItemId == item.id,
-                                onCopy: {
-                                    clipboardManager.copyToClipboard(item)
-                                },
-                                onDelete: {
-                                    clipboardManager.deleteItem(item)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 1) {
+                            let pinnedItems = filteredItems.filter { $0.isPinned }
+                            let unpinnedItems = filteredItems.filter { !$0.isPinned }
+
+                            if !pinnedItems.isEmpty {
+                                HStack {
+                                    Image(systemName: "pin.fill")
+                                        .font(.caption2)
+                                        .foregroundColor(.orange)
+                                    Text("Pinned")
+                                        .font(.caption)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.orange)
+                                    Spacer()
                                 }
-                            )
-                            .onHover { hovering in
-                                hoveredItemId = hovering ? item.id : nil
+                                .padding(.horizontal)
+                                .padding(.vertical, 4)
                             }
-                            
-                            Divider()
+
+                            ForEach(Array(filteredItems.enumerated()), id: \.element.id) { index, item in
+                                // Insert section header before first unpinned item
+                                if !pinnedItems.isEmpty && item.id == unpinnedItems.first?.id {
+                                    Divider().padding(.vertical, 2)
+                                    HStack {
+                                        Text("Recent")
+                                            .font(.caption)
+                                            .fontWeight(.semibold)
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                    }
+                                    .padding(.horizontal)
+                                    .padding(.vertical, 4)
+                                }
+
+                                ClipboardItemView(
+                                    item: item,
+                                    isHovered: hoveredItemId == item.id,
+                                    isSelected: selectedIndex == index,
+                                    onCopy: {
+                                        clipboardManager.copyToClipboard(item)
+                                    },
+                                    onDelete: {
+                                        clipboardManager.deleteItem(item)
+                                        if let sel = selectedIndex, sel >= filteredItems.count - 1 {
+                                            selectedIndex = filteredItems.count > 1 ? sel - 1 : nil
+                                        }
+                                    },
+                                    onPin: {
+                                        clipboardManager.togglePin(item)
+                                    }
+                                )
+                                .id(item.id)
+                                .onHover { hovering in
+                                    hoveredItemId = hovering ? item.id : nil
+                                }
+
+                                Divider()
+                            }
+                        }
+                    }
+                    .onChange(of: selectedIndex) { newIndex in
+                        if let idx = newIndex, idx >= 0, idx < filteredItems.count {
+                            withAnimation {
+                                proxy.scrollTo(filteredItems[idx].id, anchor: .center)
+                            }
                         }
                     }
                 }
             }
         }
         .frame(width: 400, height: 500)
+        .onChange(of: searchText) { _ in
+            selectedIndex = nil
+        }
+        .onChange(of: selectedTab) { _ in
+            selectedIndex = nil
+        }
+        .onAppear { installKeyMonitor() }
+        .onDisappear { removeKeyMonitor() }
+    }
+
+    // MARK: - Keyboard Navigation
+
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            return handleKeyEvent(event) ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+    }
+
+    private func handleKeyEvent(_ event: NSEvent) -> Bool {
+        let items = filteredItems
+        guard !items.isEmpty else { return false }
+
+        // Cmd+P — toggle pin
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "p" {
+            if let idx = selectedIndex, idx < items.count {
+                clipboardManager.togglePin(items[idx])
+            }
+            return true
+        }
+
+        // Only handle navigation keys without modifiers (allow normal typing in search)
+        // Arrow keys carry .function and .numericPad flags on macOS — strip both
+        let cleanFlags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.function, .numericPad])
+        guard cleanFlags.isEmpty else {
+            return false
+        }
+
+        switch event.specialKey {
+        case .downArrow:
+            if let idx = selectedIndex {
+                selectedIndex = (idx + 1) % items.count
+            } else {
+                selectedIndex = 0
+            }
+            return true
+        case .upArrow:
+            if let idx = selectedIndex {
+                selectedIndex = (idx - 1 + items.count) % items.count
+            } else {
+                selectedIndex = items.count - 1
+            }
+            return true
+        default:
+            break
+        }
+
+        switch event.keyCode {
+        case 36: // Return
+            if let idx = selectedIndex, idx < items.count {
+                clipboardManager.copyToClipboard(items[idx])
+            }
+            return true
+        case 51: // Delete/Backspace
+            if let idx = selectedIndex, idx < items.count {
+                clipboardManager.deleteItem(items[idx])
+                if items.count <= 1 {
+                    selectedIndex = nil
+                } else if idx >= items.count - 1 {
+                    selectedIndex = idx - 1
+                }
+            }
+            return true
+        default:
+            return false
+        }
     }
 }
 
 struct ClipboardItemView: View {
     let item: ClipboardItem
     let isHovered: Bool
+    let isSelected: Bool
     let onCopy: () -> Void
     let onDelete: () -> Void
+    let onPin: () -> Void
     
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             // Icon
-            Image(systemName: iconName)
-                .font(.title3)
-                .foregroundColor(iconColor)
-                .frame(width: 24)
-            
+            ZStack(alignment: .bottomTrailing) {
+                Image(systemName: iconName)
+                    .font(.title3)
+                    .foregroundColor(iconColor)
+                    .frame(width: 24)
+
+                if item.isPinned {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 8))
+                        .foregroundColor(.orange)
+                        .offset(x: 4, y: 4)
+                }
+            }
+
             // Content
             VStack(alignment: .leading, spacing: 4) {
                 if item.type == .image {
@@ -396,23 +663,37 @@ struct ClipboardItemView: View {
                         .lineLimit(3)
                         .font(.system(.body, design: .default))
                 }
-                
-                Text(timeAgo(from: item.timestamp))
-                    .font(.caption)
-                    .foregroundColor(.gray)
+
+                HStack(spacing: 4) {
+                    Text(timeAgo(from: item.timestamp))
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                    if item.isPinned {
+                        Text("• Pinned")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                }
             }
-            
+
             Spacer()
-            
-            // Actions (show on hover)
-            if isHovered {
+
+            // Actions (show on hover or selection)
+            if isHovered || isSelected {
                 HStack(spacing: 8) {
+                    Button(action: onPin) {
+                        Image(systemName: item.isPinned ? "pin.slash.fill" : "pin.fill")
+                            .foregroundColor(.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .help(item.isPinned ? "Unpin" : "Pin")
+
                     Button(action: onCopy) {
                         Image(systemName: "doc.on.doc")
                     }
                     .buttonStyle(.plain)
                     .help("Copy to clipboard")
-                    
+
                     Button(action: onDelete) {
                         Image(systemName: "trash")
                             .foregroundColor(.red)
@@ -423,6 +704,8 @@ struct ClipboardItemView: View {
             }
         }
         .padding()
+        .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
+        .cornerRadius(4)
         .contentShape(Rectangle())
         .onTapGesture {
             onCopy()
