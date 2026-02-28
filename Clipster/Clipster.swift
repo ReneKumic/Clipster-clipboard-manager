@@ -9,6 +9,7 @@ import SwiftUI
 import AppKit
 internal import Combine
 import Carbon
+import ServiceManagement
 
 // MARK: - Models
 
@@ -76,8 +77,17 @@ class ClipboardManager: ObservableObject {
     private var lastChangeCount: Int = 0
     private var timer: Timer?
     private var expiryTimer: Timer?
-    private let maxItems = 100
-    private let expiryInterval: TimeInterval = 12 * 60 * 60  // 12 hours
+
+    private var maxItems: Int {
+        let val = UserDefaults.standard.integer(forKey: "maxItems")
+        return val > 0 ? val : 100
+    }
+
+    private var expiryInterval: TimeInterval {
+        let hours = UserDefaults.standard.integer(forKey: "expiryHours")
+        if hours < 0 { return -1 }  // -1 means "Never"
+        return TimeInterval(hours > 0 ? hours : 12) * 3600
+    }
 
     // Screenshot directory polling
     private var screenshotTimer: Timer?
@@ -140,6 +150,8 @@ class ClipboardManager: ObservableObject {
     }
 
     private func scanForNewScreenshots() {
+        guard UserDefaults.standard.object(forKey: "monitorScreenshots") == nil
+              || UserDefaults.standard.bool(forKey: "monitorScreenshots") else { return }
         let fm = FileManager.default
         guard let allFiles = try? fm.contentsOfDirectory(atPath: screenshotsDirectory.path) else { return }
         let currentSet = Set(allFiles)
@@ -230,6 +242,7 @@ class ClipboardManager: ObservableObject {
     // MARK: - Expiry
     
     private func removeExpiredItems() {
+        guard expiryInterval > 0 else { return }  // "Never" expire
         let cutoff = Date().addingTimeInterval(-expiryInterval)
         for item in items where !item.isPinned && item.timestamp < cutoff && item.type == .image {
             if let fileName = item.imageFileName { deleteImageFile(named: fileName) }
@@ -318,7 +331,7 @@ class ClipboardManager: ObservableObject {
     
     // MARK: - Persistence
     
-
+ 
     private func saveHistory() {
         if let encoded = try? JSONEncoder().encode(items) {
             UserDefaults.standard.set(encoded, forKey: "clipboardHistory")
@@ -329,13 +342,14 @@ class ClipboardManager: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: "clipboardHistory"),
               var decoded = try? JSONDecoder().decode([ClipboardItem].self, from: data) else { return }
         
-        let cutoff = Date().addingTimeInterval(-expiryInterval)
-        
-        // Delete image files for expired unpinned items before filtering
-        for item in decoded where !item.isPinned && item.timestamp < cutoff && item.type == .image {
-            if let fileName = item.imageFileName { deleteImageFile(named: fileName) }
+        if expiryInterval > 0 {
+            let cutoff = Date().addingTimeInterval(-expiryInterval)
+            // Delete image files for expired unpinned items before filtering
+            for item in decoded where !item.isPinned && item.timestamp < cutoff && item.type == .image {
+                if let fileName = item.imageFileName { deleteImageFile(named: fileName) }
+            }
+            decoded = decoded.filter { $0.isPinned || $0.timestamp >= cutoff }
         }
-        decoded = decoded.filter { $0.isPinned || $0.timestamp >= cutoff }
         
         // Load image data from disk for image items
         for i in decoded.indices {
@@ -391,6 +405,13 @@ struct ContentView: View {
                     .fontWeight(.bold)
 
                 Spacer()
+
+                SettingsLink {
+                    Image(systemName: "gear")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Preferences")
 
                 Button(action: {
                     clipboardManager.clearAll()
@@ -747,6 +768,132 @@ struct ClipboardItemView: View {
     }
 }
 
+// MARK: - Settings View
+
+struct SettingsView: View {
+    @AppStorage("maxItems") private var maxItems: Int = 100
+    @AppStorage("expiryHours") private var expiryHours: Int = 12
+    @AppStorage("monitorScreenshots") private var monitorScreenshots: Bool = true
+    @State private var launchAtLogin: Bool = false
+    @State private var showClearConfirmation = false
+
+    private var screenshotsPath: String {
+        if let customPath = UserDefaults(suiteName: "com.apple.screencapture")?.string(forKey: "location") {
+            return (customPath as NSString).expandingTildeInPath
+        }
+        return "~/Desktop"
+    }
+
+    var body: some View {
+        TabView {
+            generalTab
+                .tabItem {
+                    Label("General", systemImage: "gear")
+                }
+
+            screenshotsTab
+                .tabItem {
+                    Label("Screenshots", systemImage: "camera.viewfinder")
+                }
+        }
+        .frame(width: 420, height: 320)
+        .onAppear {
+            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+        }
+    }
+
+    // MARK: - General Tab
+
+    private var generalTab: some View {
+        Form {
+            Section {
+                Toggle("Launch at Login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { newValue in
+                        do {
+                            if newValue {
+                                try SMAppService.mainApp.register()
+                            } else {
+                                try SMAppService.mainApp.unregister()
+                            }
+                        } catch {
+                            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+                        }
+                    }
+            } header: {
+                Text("Startup")
+            }
+
+            Section {
+                Picker("Max History Size", selection: $maxItems) {
+                    Text("25").tag(25)
+                    Text("50").tag(50)
+                    Text("100").tag(100)
+                    Text("200").tag(200)
+                    Text("500").tag(500)
+                }
+
+                Picker("Auto-Expire After", selection: $expiryHours) {
+                    Text("1 hour").tag(1)
+                    Text("6 hours").tag(6)
+                    Text("12 hours").tag(12)
+                    Text("24 hours").tag(24)
+                    Text("48 hours").tag(48)
+                    Text("Never").tag(-1)
+                }
+            } header: {
+                Text("History")
+            }
+
+            Section {
+                Button("Clear All History") {
+                    showClearConfirmation = true
+                }
+                .foregroundColor(.red)
+                .alert("Clear All History?", isPresented: $showClearConfirmation) {
+                    Button("Cancel", role: .cancel) { }
+                    Button("Clear All", role: .destructive) {
+                        UserDefaults.standard.removeObject(forKey: "clipboardHistory")
+                    }
+                } message: {
+                    Text("This will permanently delete all clipboard history including pinned items.")
+                }
+            } header: {
+                Text("Danger Zone")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+
+    // MARK: - Screenshots Tab
+
+    private var screenshotsTab: some View {
+        Form {
+            Section {
+                Toggle("Monitor Screenshot Directory", isOn: $monitorScreenshots)
+            } header: {
+                Text("Capture")
+            }
+
+            Section {
+                LabeledContent("Screenshot Location") {
+                    Text(screenshotsPath)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Text("Change this in System Settings > Keyboard > Screenshots, or via the Screenshot app (\u{2318}\u{21E7}5).")
+                    .font(.caption)
+                    .foregroundColor(.gray)
+            } header: {
+                Text("Location")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -822,7 +969,7 @@ struct ClipsterApp: App {
     
     var body: some Scene {
         Settings {
-            EmptyView()
+            SettingsView()
         }
     }
 }
