@@ -377,6 +377,7 @@ struct ContentView: View {
     @State private var selectedIndex: Int?
     @State private var keyMonitor: Any?
     @State private var selectedTab: ClipboardTab = .snippets
+    @AppStorage("hasSeenOnboarding") private var hasSeenOnboarding = false
 
     var filteredItems: [ClipboardItem] {
         var base = clipboardManager.items
@@ -550,6 +551,13 @@ struct ContentView: View {
             }
         }
         .frame(width: 400, height: 500)
+        .overlay {
+            if !hasSeenOnboarding {
+                OnboardingOverlay {
+                    hasSeenOnboarding = true
+                }
+            }
+        }
         .onChange(of: searchText) { _ in
             selectedIndex = nil
         }
@@ -643,7 +651,7 @@ struct ClipboardItemView: View {
     let onCopy: () -> Void
     let onDelete: () -> Void
     let onPin: () -> Void
-    
+    @State private var showCopiedFlash = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -679,6 +687,18 @@ struct ClipboardItemView: View {
                     Text("Image")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                } else if item.type == .code {
+                    Text(item.content)
+                        .lineLimit(3)
+                        .font(.system(.body, design: .monospaced))
+                        .padding(6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.textBackgroundColor).opacity(0.5))
+                        .cornerRadius(4)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.purple.opacity(0.3), lineWidth: 1)
+                        )
                 } else {
                     Text(item.content)
                         .lineLimit(3)
@@ -694,6 +714,16 @@ struct ClipboardItemView: View {
                             .font(.caption)
                             .foregroundColor(.orange)
                     }
+                    if item.type == .text || item.type == .code || item.type == .url {
+                        Text("•")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                        let charCount = item.content.count
+                        let wordCount = item.content.split(whereSeparator: \.isWhitespace).count
+                        Text("\(charCount) chars, \(wordCount) word\(wordCount == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                    }
                 }
             }
 
@@ -701,35 +731,71 @@ struct ClipboardItemView: View {
 
             // Actions (show on hover or selection)
             if isHovered || isSelected {
-                HStack(spacing: 8) {
-                    Button(action: onPin) {
-                        Image(systemName: item.isPinned ? "pin.slash.fill" : "pin.fill")
-                            .foregroundColor(.orange)
-                    }
-                    .buttonStyle(.plain)
-                    .help(item.isPinned ? "Unpin" : "Pin")
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Button(action: onPin) {
+                            Image(systemName: item.isPinned ? "pin.slash.fill" : "pin.fill")
+                                .foregroundColor(.orange)
+                        }
+                        .buttonStyle(.plain)
+                        .help(item.isPinned ? "Unpin (⌘P)" : "Pin (⌘P)")
 
-                    Button(action: onCopy) {
-                        Image(systemName: "doc.on.doc")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Copy to clipboard")
+                        Button(action: {
+                            onCopy()
+                            showCopiedFlash = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                                showCopiedFlash = false
+                            }
+                        }) {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copy (⏎)")
 
-                    Button(action: onDelete) {
-                        Image(systemName: "trash")
-                            .foregroundColor(.red)
+                        Button(action: onDelete) {
+                            Image(systemName: "trash")
+                                .foregroundColor(.red)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Delete (⌫)")
                     }
-                    .buttonStyle(.plain)
-                    .help("Delete")
+
+                    HStack(spacing: 6) {
+                        Text("⏎ Copy")
+                        Text("⌫ Del")
+                        Text("⌘P Pin")
+                    }
+                    .font(.system(size: 9))
+                    .foregroundColor(Color(NSColor.tertiaryLabelColor))
                 }
             }
         }
         .padding()
-        .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
+        .background(
+            ZStack {
+                isSelected ? Color.accentColor.opacity(0.15) : Color.clear
+                if showCopiedFlash {
+                    Color.green.opacity(0.15)
+                        .transition(.opacity)
+                }
+            }
+        )
+        .animation(.easeInOut(duration: 0.3), value: showCopiedFlash)
         .cornerRadius(4)
         .contentShape(Rectangle())
+        .onDrag {
+            if item.type == .image, let data = item.imageData, let nsImage = NSImage(data: data) {
+                return NSItemProvider(object: nsImage)
+            } else {
+                return NSItemProvider(object: item.content as NSString)
+            }
+        }
         .onTapGesture {
             onCopy()
+            showCopiedFlash = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                showCopiedFlash = false
+            }
         }
     }
     
@@ -764,6 +830,64 @@ struct ClipboardItemView: View {
         } else {
             let d = Int(seconds / 86400)
             return "\(d) day\(d == 1 ? "" : "s") ago"
+        }
+    }
+}
+
+// MARK: - Onboarding Overlay
+
+struct OnboardingOverlay: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.7)
+                .ignoresSafeArea()
+
+            VStack(spacing: 20) {
+                Image(systemName: "doc.on.clipboard.fill")
+                    .font(.system(size: 48))
+                    .foregroundColor(.blue)
+
+                Text("Welcome to Clipster!")
+                    .font(.title2)
+                    .fontWeight(.bold)
+
+                VStack(spacing: 12) {
+                    shortcutRow(keys: "\u{2318}\u{21E7}V", label: "Open Clipster from anywhere")
+                    shortcutRow(keys: "\u{2191}\u{2193}", label: "Navigate items")
+                    shortcutRow(keys: "\u{23CE}", label: "Copy selected item")
+                    shortcutRow(keys: "\u{232B}", label: "Delete selected item")
+                    shortcutRow(keys: "\u{2318}P", label: "Pin / unpin item")
+                }
+
+                Text("Clipster lives in your menu bar and captures everything you copy.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                Button("Get Started") {
+                    onDismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+            .padding(32)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .padding(24)
+        }
+    }
+
+    private func shortcutRow(keys: String, label: String) -> some View {
+        HStack(spacing: 12) {
+            Text(keys)
+                .font(.system(.body, design: .monospaced))
+                .fontWeight(.semibold)
+                .frame(width: 60, alignment: .trailing)
+            Text(label)
+                .foregroundColor(.secondary)
+            Spacer()
         }
     }
 }
